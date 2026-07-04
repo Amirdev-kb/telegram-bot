@@ -12,6 +12,7 @@ def ensure_db():
     with _lock:
         conn = _conn()
         c = conn.cursor()
+        # create users table if not exists
         c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -20,6 +21,14 @@ def ensure_db():
             balance INTEGER DEFAULT 0,
             last_daily TEXT
         )""")
+        # add last_play column if missing
+        c.execute("PRAGMA table_info(users)")
+        cols = [r[1] for r in c.fetchall()]
+        if 'last_play' not in cols:
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN last_play TEXT")
+            except Exception:
+                pass
         c.execute("""
         CREATE TABLE IF NOT EXISTS plays (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,14 +45,14 @@ def create_or_get_user(user_id, chat_id, name):
     with _lock:
         conn = _conn()
         c = conn.cursor()
-        c.execute("SELECT user_id, chat_id, name, balance, last_daily FROM users WHERE user_id=?", (user_id,))
+        c.execute("SELECT user_id, chat_id, name, balance, last_daily, last_play FROM users WHERE user_id=?", (user_id,))
         row = c.fetchone()
         if row:
-            user = {"user_id": row[0], "chat_id": row[1], "name": row[2], "balance": row[3], "last_daily": row[4]}
+            user = {"user_id": row[0], "chat_id": row[1], "name": row[2], "balance": row[3], "last_daily": row[4], "last_play": row[5]}
         else:
             c.execute("INSERT INTO users (user_id, chat_id, name, balance) VALUES (?, ?, ?, ?)", (user_id, chat_id, name, 100))
             conn.commit()
-            user = {"user_id": user_id, "chat_id": chat_id, "name": name, "balance": 100, "last_daily": None}
+            user = {"user_id": user_id, "chat_id": chat_id, "name": name, "balance": 100, "last_daily": None, "last_play": None}
         conn.close()
         return user
 
@@ -53,6 +62,15 @@ def add_balance(user_id, amount):
         conn = _conn()
         c = conn.cursor()
         c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        conn.commit()
+        conn.close()
+
+def set_balance(user_id, amount):
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, user_id))
         conn.commit()
         conn.close()
 
@@ -71,8 +89,11 @@ def log_play(user_id, amount, outcome):
     with _lock:
         conn = _conn()
         c = conn.cursor()
+        timestamp = datetime.utcnow().isoformat()
         c.execute("INSERT INTO plays (user_id, amount, outcome, timestamp) VALUES (?, ?, ?, ?)",
-                  (user_id, amount, outcome, datetime.utcnow().isoformat()))
+                  (user_id, amount, outcome, timestamp))
+        # update last_play
+        c.execute("UPDATE users SET last_play = ? WHERE user_id = ?", (timestamp, user_id))
         conn.commit()
         conn.close()
 
@@ -112,3 +133,22 @@ def claim_daily(user_id):
         conn.commit()
         conn.close()
         return True, amount, "موفقیت‌آمیز! جایزه به حساب شما افزوده شد."
+
+def can_play(user_id, min_seconds: int = 5):
+    """Return (True, 0) if user can play, otherwise (False, seconds_remaining)."""
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("SELECT last_play FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return True, 0
+        last = datetime.fromisoformat(row[0])
+        now = datetime.utcnow()
+        diff = (now - last).total_seconds()
+        if diff >= min_seconds:
+            return True, 0
+        else:
+            return False, int(min_seconds - diff)
