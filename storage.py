@@ -1,6 +1,7 @@
 import sqlite3
 import threading
 from datetime import datetime, timedelta
+import csv
 
 DB_PATH = "bot.db"
 _lock = threading.Lock()
@@ -19,16 +20,9 @@ def ensure_db():
             chat_id INTEGER,
             name TEXT,
             balance INTEGER DEFAULT 0,
-            last_daily TEXT
+            last_daily TEXT,
+            last_play TEXT
         )""")
-        # add last_play column if missing
-        c.execute("PRAGMA table_info(users)")
-        cols = [r[1] for r in c.fetchall()]
-        if 'last_play' not in cols:
-            try:
-                c.execute("ALTER TABLE users ADD COLUMN last_play TEXT")
-            except Exception:
-                pass
         c.execute("""
         CREATE TABLE IF NOT EXISTS plays (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,9 +31,17 @@ def ensure_db():
             outcome TEXT,
             timestamp TEXT
         )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            user_id INTEGER,
+            item_key TEXT,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, item_key)
+        )""")
         conn.commit()
         conn.close()
 
+# User helpers
 def create_or_get_user(user_id, chat_id, name):
     ensure_db()
     with _lock:
@@ -84,6 +86,7 @@ def get_user_balance(user_id):
         conn.close()
         return row[0] if row else 0
 
+# Plays
 def log_play(user_id, amount, outcome):
     ensure_db()
     with _lock:
@@ -134,6 +137,7 @@ def claim_daily(user_id):
         conn.close()
         return True, amount, "موفقیت‌آمیز! جایزه به حساب شما افزوده شد."
 
+# Cooldown
 def can_play(user_id, min_seconds: int = 5):
     """Return (True, 0) if user can play, otherwise (False, seconds_remaining)."""
     ensure_db()
@@ -152,3 +156,109 @@ def can_play(user_id, min_seconds: int = 5):
             return True, 0
         else:
             return False, int(min_seconds - diff)
+
+# Shop / Inventory
+SHOP_ITEMS = {
+    "lucky_key": {"key": "lucky_key", "name": "🎲 کلید شانس", "desc": "شانس جایزه بزرگ را برای یک بازی افزایش می‌دهد.", "price": 200},
+    "shield": {"key": "shield", "name": "🛡️ شیلد", "desc": "یک بار از جریمه جلوگیری می‌کند.", "price": 150},
+}
+
+def get_shop_items():
+    return list(SHOP_ITEMS.values())
+
+def get_inventory(user_id):
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("SELECT item_key, count FROM inventory WHERE user_id = ?", (user_id,))
+        rows = c.fetchall()
+        conn.close()
+        return {r[0]: r[1] for r in rows}
+
+def buy_item(user_id, item_key):
+    ensure_db()
+    if item_key not in SHOP_ITEMS:
+        return False, "آیتم نامعتبر است."
+    price = SHOP_ITEMS[item_key]["price"]
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return False, "کاربر پیدا نشد."
+        if row[0] < price:
+            conn.close()
+            return False, "موجودی کافی نیست."
+        # deduct
+        c.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
+        # upsert inventory
+        c.execute("SELECT count FROM inventory WHERE user_id = ? AND item_key = ?", (user_id, item_key))
+        r = c.fetchone()
+        if r:
+            c.execute("UPDATE inventory SET count = count + 1 WHERE user_id = ? AND item_key = ?", (user_id, item_key))
+        else:
+            c.execute("INSERT INTO inventory (user_id, item_key, count) VALUES (?, ?, 1)", (user_id, item_key))
+        conn.commit()
+        conn.close()
+        return True, f"خرید موفق: {SHOP_ITEMS[item_key]['name']}"
+
+def consume_item(user_id, item_key):
+    """Consume one item from inventory. Return True if consumed, False otherwise."""
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("SELECT count FROM inventory WHERE user_id = ? AND item_key = ?", (user_id, item_key))
+        r = c.fetchone()
+        if not r or r[0] <= 0:
+            conn.close()
+            return False
+        c.execute("UPDATE inventory SET count = count - 1 WHERE user_id = ? AND item_key = ?", (user_id, item_key))
+        conn.commit()
+        conn.close()
+        return True
+
+# Admin / utilities
+def add_coins(user_id, amount):
+    return add_balance(user_id, amount)
+
+def export_data(csv_path="export.csv"):
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        # export users
+        c.execute("SELECT user_id, name, balance, last_daily, last_play FROM users")
+        users = c.fetchall()
+        c.execute("SELECT id, user_id, amount, outcome, timestamp FROM plays")
+        plays = c.fetchall()
+        conn.close()
+    with open(csv_path, "w", newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["users"])
+        writer.writerow(["user_id", "name", "balance", "last_daily", "last_play"])
+        for u in users:
+            writer.writerow(u)
+        writer.writerow([])
+        writer.writerow(["plays"])
+        writer.writerow(["id", "user_id", "amount", "outcome", "timestamp"])
+        for p in plays:
+            writer.writerow(p)
+    return csv_path
+
+def reset_db():
+    """Dangerous admin operation: drops all tables and recreates schema."""
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("DROP TABLE IF EXISTS plays")
+        c.execute("DROP TABLE IF EXISTS inventory")
+        c.execute("DROP TABLE IF EXISTS users")
+        conn.commit()
+        conn.close()
+    # recreate
+    ensure_db()
