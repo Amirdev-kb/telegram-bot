@@ -28,6 +28,7 @@ def ensure_db():
             total_wins INTEGER DEFAULT 0,
             total_losses INTEGER DEFAULT 0,
             last_daily TEXT,
+            streak INTEGER DEFAULT 0,
             created_at TEXT,
             updated_at TEXT
         )""")
@@ -43,7 +44,7 @@ def ensure_db():
             timestamp TEXT
         )""")
         
-        # جدول مختارهای شامل
+        # جدول دستاوردها
         c.execute("""
         CREATE TABLE IF NOT EXISTS achievements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +65,38 @@ def ensure_db():
             timestamp TEXT
         )""")
         
+        # جدول چالش‌های روزانه
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_challenges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            challenge_type TEXT,
+            target INTEGER,
+            progress INTEGER DEFAULT 0,
+            reward INTEGER,
+            completed INTEGER DEFAULT 0,
+            date TEXT
+        )""")
+        
+        # جدول بانک
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS bank (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            deposit INTEGER DEFAULT 0,
+            interest_rate REAL DEFAULT 0.5,
+            last_interest TEXT
+        )""")
+        
+        # جدول دوستی
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS friendships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id_1 INTEGER,
+            user_id_2 INTEGER,
+            created_at TEXT
+        )""")
+        
         conn.commit()
         conn.close()
 
@@ -73,7 +106,7 @@ def create_or_get_user(user_id, chat_id, name):
     with _lock:
         conn = _conn()
         c = conn.cursor()
-        c.execute("""SELECT user_id, chat_id, name, balance, level, total_wins, total_losses, last_daily 
+        c.execute("""SELECT user_id, chat_id, name, balance, level, total_wins, total_losses, last_daily, streak 
                      FROM users WHERE user_id=?""", (user_id,))
         row = c.fetchone()
         if row:
@@ -85,7 +118,8 @@ def create_or_get_user(user_id, chat_id, name):
                 "level": row[4],
                 "total_wins": row[5],
                 "total_losses": row[6],
-                "last_daily": row[7]
+                "last_daily": row[7],
+                "streak": row[8]
             }
         else:
             now = datetime.utcnow().isoformat()
@@ -101,7 +135,8 @@ def create_or_get_user(user_id, chat_id, name):
                 "level": 1,
                 "total_wins": 0,
                 "total_losses": 0,
-                "last_daily": None
+                "last_daily": None,
+                "streak": 0
             }
         conn.close()
         return user
@@ -178,24 +213,24 @@ def log_play(user_id, amount, outcome, game_type="chest"):
         
         # به‌روزرسانی آمار برد/باخت
         if outcome == "win":
-            c.execute("UPDATE users SET total_wins = total_wins + 1 WHERE user_id = ?", (user_id,))
+            c.execute("UPDATE users SET total_wins = total_wins + 1, streak = streak + 1 WHERE user_id = ?", (user_id,))
         else:
-            c.execute("UPDATE users SET total_losses = total_losses + 1 WHERE user_id = ?", (user_id,))
+            c.execute("UPDATE users SET total_losses = total_losses + 1, streak = 0 WHERE user_id = ?", (user_id,))
         
         conn.commit()
         conn.close()
 
-def get_leaderboard(limit=10):
+def get_leaderboard(limit=15):
     """دریافت جدول امتیازات"""
     ensure_db()
     with _lock:
         conn = _conn()
         c = conn.cursor()
-        c.execute("""SELECT name, balance, level, total_wins FROM users 
+        c.execute("""SELECT name, balance, level, total_wins, streak FROM users 
                      ORDER BY balance DESC LIMIT ?""", (limit,))
         rows = c.fetchall()
         conn.close()
-        return [{"name": r[0], "balance": r[1], "level": r[2], "wins": r[3]} for r in rows]
+        return [{"name": r[0], "balance": r[1], "level": r[2], "wins": r[3], "streak": r[4]} for r in rows]
 
 def claim_daily(user_id):
     """دریافت جایزه روزانه"""
@@ -203,13 +238,14 @@ def claim_daily(user_id):
     with _lock:
         conn = _conn()
         c = conn.cursor()
-        c.execute("SELECT last_daily FROM users WHERE user_id = ?", (user_id,))
+        c.execute("SELECT last_daily, streak FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
         if not row:
             conn.close()
             return False, 0, "کاربر پیدا نشد."
         
         last = row[0]
+        streak = row[1]
         now = datetime.utcnow()
         
         if last:
@@ -223,17 +259,23 @@ def claim_daily(user_id):
         
         # اعطای جایزه
         amount = 50
+        # بونوس برای استریک
+        streak_bonus = min(streak * 5, 100)
+        total_amount = amount + streak_bonus
+        
         c.execute("""UPDATE users SET balance = balance + ?, last_daily = ? 
-                     WHERE user_id = ?""", (amount, now.isoformat(), user_id))
+                     WHERE user_id = ?""", (total_amount, now.isoformat(), user_id))
         
         # ثبت تراکنش
         c.execute("""INSERT INTO transactions (user_id, type, amount, reason, timestamp) 
                      VALUES (?, ?, ?, ?, ?)""",
-                 (user_id, "income", amount, "daily_reward", now.isoformat()))
+                 (user_id, "income", total_amount, "daily_reward", now.isoformat()))
         
         conn.commit()
         conn.close()
-        return True, amount, f"🎁 جایزه روزانه: {amount} سکه"
+        
+        msg = f"{amount} سکه + {streak_bonus} بونوس استریک" if streak_bonus > 0 else f"{amount} سکه"
+        return True, total_amount, f"✅ جایزه روزانه: {msg}"
 
 def get_user_stats(user_id):
     """دریافت آمار کاربر"""
@@ -241,7 +283,7 @@ def get_user_stats(user_id):
     with _lock:
         conn = _conn()
         c = conn.cursor()
-        c.execute("""SELECT name, balance, level, total_wins, total_losses, created_at 
+        c.execute("""SELECT name, balance, level, total_wins, total_losses, created_at, streak 
                      FROM users WHERE user_id = ?""", (user_id,))
         row = c.fetchone()
         conn.close()
@@ -260,7 +302,56 @@ def get_user_stats(user_id):
             "total_losses": row[4],
             "total_games": total_games,
             "win_rate": f"{win_rate:.1f}%",
-            "created_at": row[5]
+            "created_at": row[5],
+            "streak": row[6]
+        }
+
+def get_detailed_stats(user_id):
+    """دریافت آمار تفصیلی"""
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        
+        # اطلاعات کلی
+        c.execute("""SELECT total_wins, total_losses FROM users WHERE user_id = ?""", (user_id,))
+        row = c.fetchone()
+        total_wins = row[0] if row else 0
+        total_losses = row[1] if row else 0
+        total_games = total_wins + total_losses
+        win_rate = (total_wins / total_games * 100) if total_games > 0 else 0
+        
+        # درآمد و هزینه
+        c.execute("""SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type = 'income'""", (user_id,))
+        total_income = c.fetchone()[0] or 0
+        
+        c.execute("""SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type = 'expense'""", (user_id,))
+        total_spent = c.fetchone()[0] or 0
+        
+        # بهترین و بدترین
+        c.execute("""SELECT MAX(amount) FROM plays WHERE user_id = ? AND amount > 0""", (user_id,))
+        best_win = c.fetchone()[0] or 0
+        
+        c.execute("""SELECT MIN(amount) FROM plays WHERE user_id = ? AND amount < 0""", (user_id,))
+        worst_loss = c.fetchone()[0] or 0
+        
+        # بازی مورد علاقه
+        c.execute("""SELECT game_type FROM plays WHERE user_id = ? GROUP BY game_type ORDER BY COUNT(*) DESC LIMIT 1""", (user_id,))
+        favorite_game = c.fetchone()[0] or "نامعلوم"
+        
+        conn.close()
+        
+        return {
+            "total_games": total_games,
+            "wins": total_wins,
+            "losses": total_losses,
+            "win_rate": f"{win_rate:.1f}%",
+            "total_income": total_income,
+            "total_spent": total_spent,
+            "net": total_income - total_spent,
+            "best_win": best_win,
+            "worst_loss": worst_loss,
+            "favorite_game": favorite_game
         }
 
 def unlock_achievement(user_id, achievement_name, description):
@@ -296,3 +387,88 @@ def get_user_achievements(user_id):
         rows = c.fetchall()
         conn.close()
         return [{"name": r[0], "description": r[1]} for r in rows]
+
+def get_daily_challenge(user_id):
+    """دریافت چالش روزانه"""
+    ensure_db()
+    today = datetime.utcnow().date().isoformat()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("""SELECT challenge_type, target, progress, reward, completed FROM daily_challenges 
+                     WHERE user_id = ? AND date = ?""", (user_id, today))
+        row = c.fetchone()
+        
+        if not row:
+            # ایجاد چالش جدید
+            import random
+            challenge_types = {
+                "wins": {"description": "۵ بار برنده شو", "target": 5},
+                "games": {"description": "۱۰ بازی بازی کن", "target": 10},
+                "streak": {"description": "۳ بار پی‌در‌پی برنده شو", "target": 3},
+            }
+            challenge_type = random.choice(list(challenge_types.keys()))
+            target = challenge_types[challenge_type]["target"]
+            reward = 100
+            
+            c.execute("""INSERT INTO daily_challenges (user_id, challenge_type, target, reward, date) 
+                         VALUES (?, ?, ?, ?, ?)""",
+                     (user_id, challenge_type, target, reward, today))
+            conn.commit()
+            
+            return {
+                "description": challenge_types[challenge_type]["description"],
+                "target": target,
+                "progress": 0,
+                "reward": reward,
+                "completed": False
+            }
+        
+        conn.close()
+        return {
+            "description": row[0],
+            "target": row[1],
+            "progress": row[2],
+            "reward": row[3],
+            "completed": bool(row[4])
+        }
+
+def get_bank_info(user_id):
+    """دریافت اطلاعات بانک"""
+    ensure_db()
+    with _lock:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("""SELECT balance, deposit, interest_rate, last_interest FROM bank WHERE user_id = ?""", (user_id,))
+        row = c.fetchone()
+        
+        if not row:
+            c.execute("""INSERT INTO bank (user_id) VALUES (?)""", (user_id,))
+            conn.commit()
+            conn.close()
+            return {
+                "balance": 0,
+                "deposit": 0,
+                "interest": 0.5,
+                "interest_ready": False
+            }
+        
+        conn.close()
+        
+        last_interest = row[3]
+        now = datetime.utcnow()
+        interest_ready = False
+        
+        if last_interest:
+            last_dt = datetime.fromisoformat(last_interest)
+            if now - last_dt >= timedelta(hours=24):
+                interest_ready = True
+        else:
+            interest_ready = True
+        
+        return {
+            "balance": row[0],
+            "deposit": row[1],
+            "interest": row[2],
+            "interest_ready": interest_ready
+        }
